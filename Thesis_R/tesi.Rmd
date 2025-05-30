@@ -1,0 +1,777 @@
+---
+title: "Tesi"
+author: "Pedron Matteo"
+output:
+  html_document:
+    toc: true
+    number_sections: false
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE, message=FALSE}
+rm(list=ls())
+gc()
+
+library(dplyr)
+library(MASS)
+library(spd) 
+library(sn)             # univariate / multivariate skew-t distribution
+library(CVXR)
+
+# basic finance
+library(xts)   
+library(quantmod)   
+library(pob)            # book package with financial data
+library(stochvol)       # to compute volatility envelope
+library(tseries)        # jarque.bera.test
+library(rugarch)
+library(forecast)       # auto.arima
+
+# plotting
+library(ggplot2)
+library(viridisLite)
+library(gridExtra)      # for grid.arrange
+library(reshape2)    
+library(patchwork)      # for combining plots
+library(scales)
+```
+
+
+
+
+# Load the data
+
+In this section, I retrieve the historical price data for the following 5 stocks:
+
+- **Intesa Sanpaolo S.p.A.**: `ISP.MI` 
+- **UniCredit S.p.A.**: `UCG.MI` 
+- **Eni S.p.A.**: `ENI.MI` 
+- **Stellantis N.V.**: `STLAM.MI` 
+- **STMicroelectronics N.V.**: `STMMI.MI` 
+
+The data covers the period from January 1 2019 to Aprile 1 2025.
+
+```{r, include=FALSE, eval=FALSE}
+# Get current date
+current_date = "2025-04-01"
+
+# Define tickers
+tickers = c("ISP.MI", "UCG.MI", "ENI.MI", "STLAM.MI", "STMMI.MI")
+
+# Retrieve adjusted prices for each ticker
+# VIX_p = Ad(getSymbols("^VIX", from="2019-01-01", to="2025-02-06", auto.assign=FALSE))
+ISP_p = Ad(getSymbols("ISP.MI", from="2019-01-01", to=current_date, auto.assign=FALSE))
+UCG_p = Ad(getSymbols("UCG.MI", from="2019-01-01", to=current_date, auto.assign=FALSE))
+ENI_p = Ad(getSymbols("ENI.MI", from="2019-01-01", to=current_date, auto.assign=FALSE))
+STLAM_p = Ad(getSymbols("STLAM.MI", from="2019-01-01", to=current_date, auto.assign=FALSE))
+STMMI_p = Ad(getSymbols("STMMI.MI", from="2019-01-01", to=current_date, auto.assign=FALSE))
+
+# Combine all together
+stocks = data.frame(Date = index(ISP_p), ISP_p, UCG_p, ENI_p, STLAM_p, STMMI_p)
+colnames(stocks) = c("Date", "ISP", "UCG", "ENI", "STLAM", "STMMI")
+
+# Save the dataframe to the workspace
+save(stocks, file="stocks.RData")
+```
+
+```{r, echo=FALSE}
+load("stocks.RData")
+stocks_xts = xts(stocks[,2:6], order.by = stocks$Date)
+# compute log_returns
+returns = apply(stocks[, -1], 2, function(x) diff(log(x)))
+returns = xts(returns, order.by = stocks$Date[-1])
+```
+
+
+
+# Exploratory Data Analysis
+
+Separate the in-sample data
+
+```{r, include=FALSE}
+t_0 = as.Date("2025-01-31")
+
+# For plots and summary statistics
+stocks = stocks %>% filter(Date <= t_0)
+```
+
+```{r, echo=FALSE}
+# Plot the log_10 prices
+
+# Reshape the df to long format
+stocks_long = melt(stocks, id.vars = "Date", variable.name = "Stock", value.name = "Price")
+
+# Create list for individual plots
+price_plots = list()
+stock_names = unique(stocks_long$Stock)
+
+# Loop and create each plot with stock name as title
+for (stock in stock_names) {
+    stock_data <- subset(stocks_long, Stock == stock)
+  
+    p <- ggplot(stock_data, aes(x = Date, y = Price)) +
+        geom_line(linewidth = 0.8, color = "blue") +
+        scale_x_date(date_breaks = "1 year", date_labels = "%Y", date_minor_breaks = "1 month") +
+        scale_y_log10() +
+        xlab(NULL) + ylab(NULL) +
+        ggtitle(stock) +  # Stock name as title
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5))
+  
+    price_plots[[stock]] <- p
+}
+
+# Arrange all plots in a 2x3 grid with a general title
+grid.arrange(grobs = price_plots, ncol = 3, nrow = 2)    # , top = "Log Prices"
+
+# Clean up
+rm(stocks_long, stock_data, p, price_plots)
+
+```
+
+Now I compute the daily log-returns for each time series.
+
+```{r, echo=FALSE}
+# Compute log-returns for each stock and create a df
+log_returns = apply(stocks[, -1], 2, function(x) diff(log(x)))
+# Multiply the log returns by 100
+log_returns = log_returns * 100
+log_returns = data.frame(Date = stocks$Date[-1], log_returns)
+# tail(log_returns)
+```
+
+```{r, echo=FALSE}
+# Plot the log-returns
+
+# Reshape the df to long format
+log_returns_long = melt(log_returns, id.vars = "Date", variable.name = "Stock", value.name = "Return")
+
+# Create a list to store individual plots
+return_plots = list()
+stock_names = unique(log_returns_long$Stock)
+
+# Loop through stocks and create plots for log-returns
+for (stock in stock_names) {
+    stock_data <- subset(log_returns_long, Stock == stock)
+  
+    # Create the plot with stock name as title
+    p <- ggplot(stock_data, aes(x = Date, y = Return)) +
+        geom_line(linewidth = 0.5, color = "blue", show.legend = FALSE) +
+        scale_x_date(date_breaks = "1 year", date_labels = "%Y", date_minor_breaks = "1 month") +
+        ggtitle(stock) +  # Stock name as the title
+        xlab(NULL) + ylab(NULL) +  # Remove axis labels
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5))
+  
+    return_plots[[stock]] <- p  
+}
+
+# Arrange all plots in a 2x3 grid with a general title
+grid.arrange(grobs = return_plots, ncol = 3, nrow = 2)    # , top = "Log Returns"
+
+# Clean up
+rm(stock_data, p, return_plots)
+
+```
+
+```{r, echo=FALSE}
+# Plot the histogram of the log-returns
+
+# Create a list to store individual histograms
+return_hists = list()
+
+# Loop through stock names to create histograms for log-returns
+for (stock in stock_names) {
+    stock_data <- subset(log_returns_long, Stock == stock)
+  
+    # Create the histogram with stock name as title
+    p <- ggplot(stock_data, aes(x = Return)) +
+        geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "blue", alpha = 0.3, col = "gray31") +
+        ggtitle(stock) +  # Stock name as the title
+        xlab(NULL) + ylab(NULL) +
+        theme_minimal() +
+        theme(  
+            # axis.text.y = element_blank(),
+            plot.title = element_text(hjust = 0.5)
+        )
+  
+    return_hists[[stock]] <- p
+}
+
+# Plot in a 2x3 grid with a general title
+grid.arrange(grobs = return_hists, ncol = 3, nrow = 2)
+
+# Clean up
+rm(log_returns_long, return_hists, stock_data, p)
+```
+
+The following dataframe presents key statistical measures and normality test results:  
+
+- **α Trimmed Mean**: the mean calculated after trimming `α` proportion of extreme values.  
+- **MAD (Median Absolute Deviation)**: a robust measure of statistical dispersion.  
+- **Jarque-Bera Test (p-value)**: tests whether the data follows a normal distribution based on skewness and kurtosis.  
+- **Shapiro-Wilk Test (p-value)**: A normality test assessing whether the sample comes from a normal distribution.  
+
+```{r, echo=FALSE}
+# Initialize an empty dataframe
+stats_df = data.frame(
+    Stock = colnames(log_returns[,-1]),
+    Trimmed_Mean = numeric(5),
+    MAD = numeric(5),
+    Jarque_Bera_p = numeric(5),
+    Shapiro_Wilk_p = numeric(5)
+)
+
+# Compute statistics for each stock
+for (i in 1:5) {
+    stock_returns = log_returns[,i+1]
+  
+    stats_df$Trimmed_Mean[i] = round(mean(stock_returns, trim=0.10), 4)
+    stats_df$MAD[i] = round(mad(stock_returns), 4)
+  
+    # Jarque-Bera test
+    jb_test = jarque.bera.test(stock_returns)
+    stats_df$Jarque_Bera_p[i] = jb_test$p.value  
+  
+    # Shapiro-Wilk test
+    shapiro_test = shapiro.test(stock_returns)
+    stats_df$Shapiro_Wilk_p[i] = round(shapiro_test$p.value, 4)
+}
+
+print(stats_df)
+
+# Remove variables no longer needed
+rm(stock_returns, jb_test, shapiro_test, stats_df)
+```
+
+Let us investigate the temporal dependencies and structure within the log-return series.
+
+```{r, echo=FALSE}
+# ACF of the log-returns
+
+# Create a list to store individual ACF plots
+acf_plots = list()
+
+for (col_name in stock_names) {
+    
+    series = log_returns[[col_name]]    # Take the log-returns
+    n = length(series)  # Number of observations
+
+    # Compute ACF
+    series_acf = acf(series, plot = FALSE, lag.max = 20)  # Limit to 20 lags
+
+    # Convert ACF results to a data frame
+    acf_df = data.frame(Lag = series_acf$lag, ACF = series_acf$acf)
+
+    # 95% Confidence Intervals for ACF
+    conf_int = 1.96 / sqrt(n)
+
+    # Create ACF plot with light blue confidence bands
+    p1 = ggplot(acf_df, aes(x = Lag, y = ACF)) +
+        geom_ribbon(aes(ymin = -conf_int, ymax = conf_int), fill = "blue", alpha = 0.5) +  # Blue shaded CI
+        geom_segment(aes(xend = Lag, yend = 0)) +  # Bars for ACF
+        geom_point(color = "blue", size = 2) +     # Points for each lag
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        geom_hline(yintercept = conf_int, linetype = "dotted", color = "red") +  # Upper CI
+        geom_hline(yintercept = -conf_int, linetype = "dotted", color = "red") + # Lower CI
+        ggtitle(col_name) +   # Stock name as title
+        xlab("Lag") + ylab(NULL) +
+        scale_x_continuous(
+            breaks = seq(0, 20, by = 1),    # Limit x-axis to 20 lags
+            labels = function(x) ifelse(x %% 5 == 0, as.character(x), "")  # Show labels every 5 lags
+        ) + 
+        scale_y_continuous(limits = c(-0.15, 1)) +
+        theme_minimal() +      # Clean theme
+        theme(
+            # axis.text.y = element_blank(),  # Remove y-axis text for clarity
+            plot.title = element_text(hjust = 0.5),  # Center the title
+            axis.text.x = element_text(angle = 45, hjust = 1)  # Rotate x-axis labels for better visibility
+        ) 
+
+    # Store the plot in the list
+    acf_plots[[col_name]] = p1
+}
+
+# Arrange all ACF plots in a grid (e.g., 2x3 grid)
+grid.arrange(grobs = acf_plots, ncol = 3, nrow = 2)
+
+# Clean up
+rm(series, n, series_acf, acf_df, conf_int, p1, col_name, acf_plots)
+
+```
+
+Let us examine the temporal dependencies and structure within the absolute value 
+of the log-return series.
+
+```{r, echo=FALSE}
+# ACF of the absolute value of the log-returns
+
+# Create a list to store individual ACF plots
+acf_plots = list()
+
+for (col_name in stock_names) {
+    
+    series = abs(log_returns[[col_name]])  # Take the absolute log-returns
+    n = length(series)  # Number of observations
+
+    # Compute ACF
+    series_acf = acf(series, plot = FALSE, lag.max = 20)  # Limit to 20 lags
+
+    # Convert ACF results to a data frame
+    acf_df = data.frame(Lag = series_acf$lag, ACF = series_acf$acf)
+
+    # 95% Confidence Intervals for ACF
+    conf_int = 1.96 / sqrt(n)
+
+    # Create ACF plot with light blue confidence bands
+    p1 = ggplot(acf_df, aes(x = Lag, y = ACF)) +
+        geom_ribbon(aes(ymin = -conf_int, ymax = conf_int), fill = "blue", alpha = 0.5) +  # Blue shaded CI
+        geom_segment(aes(xend = Lag, yend = 0)) +  # Bars for ACF
+        geom_point(color = "blue", size = 2) +     # Points for each lag
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        geom_hline(yintercept = conf_int, linetype = "dotted", color = "red") +  # Upper CI
+        geom_hline(yintercept = -conf_int, linetype = "dotted", color = "red") + # Lower CI
+        ggtitle(col_name) +   # Stock name as title
+        xlab("Lag") + ylab(NULL) +
+        scale_x_continuous(
+            breaks = seq(0, 20, by = 1),    # Limit x-axis to 20 lags
+            labels = function(x) ifelse(x %% 5 == 0, as.character(x), "")  # Show labels every 5 lags
+        ) + 
+        scale_y_continuous(limits = c(-0.15, 1)) +
+        theme_minimal() +      # Clean theme
+        theme(
+            # axis.text.y = element_blank(),  # Remove y-axis text for clarity
+            plot.title = element_text(hjust = 0.5),  # Center the title
+            axis.text.x = element_text(angle = 45, hjust = 1)  # Rotate x-axis labels for better visibility
+        ) 
+
+    # Store the plot in the list
+    acf_plots[[col_name]] = p1
+}
+
+# Arrange all ACF plots in a grid (e.g., 2x3 grid)
+grid.arrange(grobs = acf_plots, ncol = 3, nrow = 2)
+
+# Clean up
+rm(series, n, series_acf, acf_df, conf_int, p1, col_name, acf_plots, log_returns)
+
+```
+
+From the previous plots, we observe the absence of linear dependence in the ACF 
+and PACF of the log returns. In contrast, temporal dependencies are evident in 
+the corresponding plots of the absolute value of the returns.
+
+
+
+
+# Statistical Analysis
+
+```{r, include=FALSE}
+# Define a function that returns the coefficients for the ARMA model
+ARMA_coef = function(x) {
+    # for seeing all the combinations -> # trace = T
+    model = auto.arima(x, max.p = 1, max.q = 1, d = 0, 
+                   seasonal = F, ic = "aic")    
+    return(as.list(model$coef))
+}
+```
+
+```{r, include=FALSE}
+# Define a function that simulates from the desidered copula model
+simulate_from_copula = function(Z, copula_name) {
+    
+    # set.seed(123)
+    
+    # Create empty tensor to store simulated standardized residuals
+    tensor = array(0, dim = c(L, M, d))
+    
+    if (copula_name == "skew-t") {
+        
+        # Fit multivariate skew-t distribution to the standardized residuals
+        fit = mst.mple(y = Z, penalty = NULL)
+
+        # Extract estimated parameters from the fitted model
+        xi_hat      = as.vector(fit$dp$beta)     # Location vector (ξ) 
+        Omega_hat   = fit$dp$Omega               # Scale matrix (Ω)  
+        omega_vec   = sqrt(diag(Omega_hat))
+        alpha_hat   = fit$dp$alpha               # Skewness vector (α) 
+        nu_hat      = fit$dp$nu                  # Degrees of freedom (ν) 
+        
+        # For each column of the tensor
+        for (m in 1:M) {
+      
+            # Step 1: Simulate L values from the multivariate skew-t distribution
+            mst_sim = rmst(n = L, xi = xi_hat, Omega_hat, alpha_hat, nu = nu_hat)
+      
+            # Step 2: Transform to pseudo-observations via skew-t CDF
+            U_new = matrix(0, nrow = L, ncol = d)
+            for (i in 1:d) {
+                U_new[, i] = sapply(mst_sim[, i], function(y)
+                                        pst(y,
+                                            xi    = xi_hat[i],
+                                            omega = omega_vec[i],
+                                            alpha = alpha_hat[i],
+                                            nu    = nu_hat
+                                        )
+                                )
+            }
+    
+            # Step 3: Bound values away from 0 and 1
+            U_new = pmin(pmax(U_new, 1e-5), 1 - 1e-5)
+            
+            # Step 4: Store U_new
+            tensor[, m, ] = U_new
+        }
+    }
+    
+    
+    if (copula_name == "skew-n") {
+        
+        # Fit multivariate skew-normal distribution to the standardized residuals
+        fit = msn.mle(y = Z)
+        
+        # Extract estimated parameters from the fitted model
+        xi_hat      = as.vector(fit$dp$beta)     # Location vector (ξ) 
+        Omega_hat   = fit$dp$Omega               # Scale matrix (Ω)  
+        omega_vec   = sqrt(diag(Omega_hat))
+        alpha_hat   = fit$dp$alpha               # Shape vector (α) 
+        
+        # For each column of the tensor
+        for (m in 1:M) {
+      
+            # Step 1: Simulate L values from the skew-t copula
+            msn_sim = rmsn(n = L, xi = xi_hat, Omega_hat, alpha_hat)
+      
+            # Step 2: Transform to pseudo-observations via skew-normal CDF
+            U_new = matrix(0, nrow = L, ncol = d)
+            for (i in 1:d) {
+                U_new[, i] = sapply(msn_sim[, i], function(y)
+                                            psn(y,
+                                                xi    = xi_hat[i],
+                                                omega = omega_vec[i],
+                                                alpha = alpha_hat[i]
+                                            )
+                                )
+            }
+    
+            # Step 3: Bound values away from 0 and 1
+            U_new = pmin(pmax(U_new, 1e-5), 1 - 1e-5)
+            
+            # Step 4: Store U_new
+            tensor[, m, ] = U_new
+        }
+    }
+    
+    return(list(tensor = tensor, alpha = alpha_hat))
+}
+```
+
+```{r, include=FALSE}
+# Computes the optimal portfolio weights by minimizing Entropic Value at Risk (EVaR)
+# https://portfoliooptimizationbook.com (the function can be found here)
+portfolioEVaR_CVXR = function(X, r_pred, lb, ub, lmd = 1000, alpha = 0.95) {
+    T = nrow(X)
+    N = ncol(X)
+    X = as.matrix(X)
+    mu = r_pred
+  
+    # CVXR
+    w = Variable(N)
+    s = Variable(1)
+    t = Variable(1)
+    u = Variable(T)
+  
+    prob = Problem(Maximize( t(w) %*% mu - lmd*( s - t*log((1-alpha)*T) ) ),
+                constraints = list(CVXR:::ExpCone(- X %*% w - s, t*rep(1,T), u),
+                                    t >= sum(u),
+                                    w >= lb,   
+                                    sum(w) == 1,    # full-investing
+                                    w <= ub       
+                                   )
+                )
+  
+    # Try solving once
+    result = tryCatch({
+        solve(prob, num_iter = 200, verbose = FALSE)
+    }, error = function(e) {
+        warning(paste("Solver failed:", conditionMessage(e)))
+        return(NULL)
+    })
+
+    # If result is invalid or extraction fails, return NULL
+    if (is.null(result) || is.null(tryCatch(result$getValue(w), error = function(e) NULL))) {
+        return(NULL)
+    }
+    
+    return(as.vector(result$getValue(w)))
+}
+```
+
+```{r, echo=FALSE}
+# Define variables L, M and T (TT)
+# The definition of the variables is in the paper presented in the slides in the introduction
+
+stocks_index = index(stocks_xts)
+# Number of times I simulate from the copula model
+M = 30           # This heavily affects the time of execution
+d = length(stock_names)
+
+# L: Length of in-sample window (between 2022-01-01 and t_0)
+L = sum(stocks_index > "2022-01-01" & stocks_index <= t_0)
+in_sample_dates = index(returns["2022-01-01/"])
+
+# TT: Number of out-of-sample points
+TT = sum(stocks_index > t_0) 
+# List of dates: t_0 + out-of-sample dates
+out_sample_dates = stocks_index[stocks_index >= t_0]
+
+```
+
+```{r}
+# Don't run directly all the chunk
+# In step 4, select the name of the copula model
+# In step 6, change the name of the portfolio weights
+# - w_t : skew-t copula portfolio
+# - w_n : skew-normal copula portfolio
+# Run one time with w_t and one time with w_n
+
+set.seed(1234)
+
+# Vector of portfolio weights
+w_t = matrix(0, nrow=TT, ncol=d)            # skew-t copula
+w_n = matrix(0, nrow=TT, ncol=d)            # skew-n copula
+
+# Matrix for storing the values of the parameter alpha of the copula
+alpha_t = matrix(0, nrow=TT, ncol=d)
+alpha_n = matrix(0, nrow=TT, ncol=d)
+
+# First window [t0 - L + 1, t0]
+for (j in 1:TT) {         
+    
+    # Step 1: Subset the dataset
+    start_date = in_sample_dates[j]
+    end_date = out_sample_dates[j]
+    train = returns[paste(start_date, end_date, sep = "/")]
+    
+    
+    
+    # Step 2: Model specification and estimation: ARMA + GJR-GARCH(1,1)
+    
+    # List to store the fitted models
+    arma_garch_models = list()
+
+    # Matrix to store standardized residuals 
+    Z = matrix(nrow = L, ncol = d)
+
+    # Array to store mu_t_hat and sigma_t_hat
+    mu_hat = rep(0, d)
+    sigma_hat = rep(0, d)
+
+    for (i in 1:d) {
+        
+        # Select ARMA parameters
+        coefs = ARMA_coef(train[,i])       
+        m = ifelse(is.null(coefs$intercept), FALSE, TRUE)
+        p = ifelse(is.null(coefs$ar1), 0, 1)  
+        q = ifelse(is.null(coefs$ma1), 0, 1) 
+        
+        # Specify the ARMA-GJR-GARCH model
+        gar_spec = ugarchspec(mean.model = list(armaOrder = c(p,q), include.mean = m),
+                        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+                        distribution.model = "sstd"    
+                      )
+         
+        # Fit the model
+        x = ugarchfit(data=train[,i, drop=F], spec=gar_spec)   # replace train
+        arma_garch_models[[i]] = x
+        
+        # Store standardized residuals
+        Z[,i] = as.numeric(residuals(x, standardize=T))
+        
+        # Forecast conditional mean and volatility
+        forecast = ugarchforecast(x, n.ahead = 1)
+        mu_hat[i] = as.numeric(forecast@forecast$seriesFor)
+        sigma_hat[i] = sqrt(as.numeric(sigma(forecast)))
+        
+    }
+
+    rm(coefs, m, p, q, gar_spec, forecast)
+    
+    
+    
+    # Step 3: Fit semiparametric distribution (SPD) models to marginal standardized residuals
+    
+    # List for fitted SPD models
+    spd_models = list()
+    
+    for (i in 1:d) {
+        # Fit SPD model to the standardized residuals
+        x = spdfit(Z[,i])
+        # Store the model
+        spd_models[[i]] = x
+    }
+    
+    rm(x)
+    
+    
+    
+    # Step 4: Simulate from the copula and compute new standardized residuals
+    
+    # Simulate from fitted copula 
+    sfc = simulate_from_copula(Z, "skew-n")
+    tensor = sfc$tensor         # all(tensor > 0 & tensor < 1)
+    alpha_n[j, ] = sfc$alpha
+
+    # all(tensor >= 0 & tensor <= 1)
+
+    # Transform to standardized residuals using inverse SPD
+    for (m in 1:M) {
+        for (i in 1:d) {
+            x_spd = spd_models[[i]]
+            tensor[, m, i] = qspd(tensor[, m, i], x_spd)  
+        }
+    }
+
+    rm(m, x_spd)
+    
+    
+    
+    # Step 5: Predict one-step ahead returns
+    
+    # Predict standardized residuals as median across simulations
+    z_hat = apply(tensor[L, , ], MARGIN = 2, FUN = median)
+    
+    # One-day ahead forecast of returns
+    r_pred = rep(0,d)
+    r_pred = mu_hat + z_hat * sigma_hat
+    
+    
+    
+    # Step 6: Calculate portfolio weights
+    w_new = portfolioEVaR_CVXR(train, r_pred, 0.10, 0.25)
+
+    if (!is.null(w_new)) {
+        w_n[j, ] = w_new
+    } else {
+        w_n[j, ] = w_n[j - 1, ]  # Reuse previous weight vector
+    }
+
+    print(j)
+    
+}
+```
+
+```{r, include=FALSE}
+# Rebalance portfolio weights every k days (starting from Day 1)
+#
+# @param  rebalance_every  Must be >=1 and <= number of out-of-sample dates 
+
+rebalance_weights = function(weights_mat, rebalance_every) {
+    
+    # If rebalance_every = 1, return the original matrix
+    if (rebalance_every == 1) return(weights_mat)
+    
+    n = nrow(weights_mat)
+    d = ncol(weights_mat)
+    weights_reb = matrix(0, nrow = n, ncol = d)
+
+    # Initialize with Day 1 weights
+    current_weights = weights_mat[1, ]  
+
+    for (day in 1:n) {
+        if ((day - 1) %% rebalance_every == 0) {
+            # update weights on rebalance day
+            current_weights = weights_mat[day, ]  
+        }
+        # assign current weights
+        weights_reb[day, ] = current_weights  
+    }
+
+    rownames(weights_reb) = rownames(weights_mat)
+    return(weights_reb)
+}
+
+```
+
+```{r, echo=FALSE}
+# https://rpubs.com/DonnieDarkowitz/702869
+# out of sample returns
+fut_returns = returns[index(returns) > t_0]
+
+# Cumulative return of the equal weight portfolio - Portfolio1
+w_EWP = rep(1/d, d)
+EWP_returns = fut_returns %*% w_EWP
+cum_ret_portf1 = cumprod(1 + EWP_returns) - 1
+cum_ret_portf1 = xts(c(0, cum_ret_portf1), order.by = out_sample_dates)
+
+# Cumulative return of portfolio skew-t - Portfolio 2
+## Run the next line if you want to rebalance the portfolio
+w_t_reb = rebalance_weights(w_t, 5)
+portf2_returns = rowSums(w_t_reb * fut_returns)
+cum_ret_portf2 = cumprod(1 + portf2_returns) - 1
+cum_ret_portf2 = xts(c(0, cum_ret_portf2), order.by = out_sample_dates)
+
+# Cumulative return of portfolio skew-n - Portfolio 3
+## Run the next line if you want to rebalance the portfolio
+w_n_reb = rebalance_weights(w_n, 5)
+portf3_returns = rowSums(w_n_reb * fut_returns)
+cum_ret_portf3 = cumprod(1 + portf3_returns) - 1
+cum_ret_portf3 = xts(c(0, cum_ret_portf3), order.by = out_sample_dates)
+
+# tail(cbind(EWP_returns, portf2_returns, portf3_returns) * 100, n=10)
+round(tail(cbind(cum_ret_portf1, cum_ret_portf2, cum_ret_portf3) * 100, n=1), 4)
+```
+
+```{r, include=FALSE, eval=FALSE}
+# Weights reported in the thesis in Section 3.4 (table 3.3)
+rebalance_indices = seq(1, nrow(w_n_reb), by = 5)
+w_n1 = w_n_reb[rebalance_indices, ]
+w_t2 = w_t_reb[rebalance_indices, ]
+colnames(w_n1) = stock_names
+colnames(w_t2) = stock_names
+cbind(w_n1, w_t2)
+```
+
+```{r, echo=FALSE}
+# Combine both cumulative returns into one data frame for easy plotting
+cum_returns_df = data.frame(
+    Date = index(cum_ret_portf1),
+    EWP = coredata(cum_ret_portf1),
+    t_copula = coredata(cum_ret_portf2),  
+    n_copula = coredata(cum_ret_portf3)  
+)
+
+# Melt the data frame to long format
+cum_returns_long = melt(cum_returns_df, id.vars = "Date", 
+                        variable.name = "Portfolio", value.name = "CumulativeReturn")
+
+# Plotting the cumulative returns
+ggplot(cum_returns_long, aes(x = Date, y = CumulativeReturn, color = Portfolio)) +
+    geom_line(linewidth = 1) +
+    labs(
+        title = "Cumulative Returns of EWP vs Copula Portfolios",
+        x = "Date", y = "Cumulative Return"
+    ) +
+    theme_minimal() +
+    scale_color_manual(
+        values = c("EWP" = "blue", "t_copula" = "red", "n_copula" = "yellow"),
+        labels = c("EWP", "t-Copula", "Normal-Copula")
+    ) +
+    theme(legend.title = element_blank(), legend.position = "bottom") +
+    guides(color = guide_legend(title = "Portfolio"))
+
+rm(cum_returns_long)
+
+# ggsave("cumulative_returns_plot.png", width = 10, height = 6, dpi = 300)
+
+```
+
+
+
+
+
